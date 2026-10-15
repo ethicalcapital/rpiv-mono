@@ -49,7 +49,7 @@ import {
 	type Workflow,
 } from "@juicesharp/rpiv-workflow/registration";
 import { rpivBucketOutcome } from "../artifact-collector.js";
-import { COMMIT_BASELINE_PROMPT, latestFsArtifact } from "../built-ins/index.js";
+import { commitPrompt, latestFsArtifact } from "../built-ins/index.js";
 import { lessonsBlock, recordLessons } from "./lessons.js";
 import { captureGoalKeepingWip, wipIntact, wipNotice } from "./wip-guard.js";
 
@@ -552,7 +552,14 @@ export function defineUnitGraph(g: UnitGraphSpec): Workflow {
 	});
 
 	if (commit) {
-		stages.commit = acts({ prompt: COMMIT_BASELINE_PROMPT, outcome: gitCommitOutcome });
+		// Reviewed only when the last unit's own gate passed: a unit advanced red
+		// by `onExhausted: "advance"` also routes here, and must still ask.
+		const last = names.at(-1)!;
+		const lastUnitPassed = (state: RunView): boolean => gateRecords(state, last).at(-1)?.decision === "pass";
+		stages.commit = acts({
+			prompt: commitPrompt({ baseline: true, reviewed: lastUnitPassed }),
+			outcome: gitCommitOutcome,
+		});
 		edges.commit = "learn";
 	}
 	// The learning edge: every accepted run leaves its corrected failures behind as
