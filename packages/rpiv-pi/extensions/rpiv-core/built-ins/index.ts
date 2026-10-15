@@ -6,6 +6,7 @@
  * `.ts`).
  */
 
+export { COMMIT_BASELINE_PROMPT, commitPrompt, REVIEWED_COMMIT_PROMPT } from "./commit-prompt.js";
 export { designOutcome, designParser, designStructure } from "./design.js";
 export { elaborationOutcome, elaborationParser, elaborationStructure } from "./elaboration.js";
 export {
@@ -39,12 +40,7 @@ export {
 	verdictBlocks,
 	verdictRiskRulings,
 } from "./gates.js";
-export {
-	COMMIT_BASELINE_PROMPT,
-	captureGoal,
-	captureReviewScope,
-	VALIDATE_GOAL_PROMPT,
-} from "./goal-baseline.js";
+export { captureGoal, captureReviewScope, VALIDATE_GOAL_PROMPT } from "./goal-baseline.js";
 export {
 	CODE_CONFIRM_FANOUT,
 	CODE_DIMENSION_FANOUT,
