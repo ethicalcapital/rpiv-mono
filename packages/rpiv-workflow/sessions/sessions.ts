@@ -25,7 +25,14 @@
 
 import { WorkflowAbortError } from "../internal-utils.js";
 import type { SessionRef } from "../state/index.js";
-import { type BranchEntry, classifyStop, readBranch, readSessionRef, type StopSignal } from "../transcript.js";
+import {
+	type BranchEntry,
+	classifyStop,
+	hasLeakedToolMarkup,
+	readBranch,
+	readSessionRef,
+	type StopSignal,
+} from "../transcript.js";
 import type { StageSessionContext, WorkflowHostContext, WorkflowSessionContext } from "../types.js";
 import { bashStrikesRemaining, bashTimeoutSteeringMessage, consumeBashStrike } from "./bash-strikes.js";
 import { produceAndValidateOutput } from "./extraction.js";
@@ -39,6 +46,8 @@ import { recordStageSuccess } from "./success-persist.js";
 
 /** Execute one DAG stage (or loop unit) in its own detached child session. */
 export async function executeStageSession(ctx: WorkflowHostContext, s: StageSessionContext): Promise<void> {
+	// Open the stage window: collectors accept only artifacts written after this (kata mykj).
+	s.stageStartedAtMs ??= Date.now();
 	await spawnChildAndRun(ctx, s, (child) => postStage(ctx, child, s));
 }
 
@@ -62,6 +71,7 @@ export async function continueStageSession(
 	s: StageSessionContext,
 ): Promise<void> {
 	const offset = readBranch(child).length;
+	s.stageStartedAtMs ??= Date.now();
 	await resendIntoChild(child, s.prompt);
 	await postStage(observerCtx, child, s, offset);
 }
@@ -116,6 +126,20 @@ export async function postStage(
 	// child is disposed when the stage ends.
 	if (outcome.stop !== "stop")
 		return haltStageOrSoftHalt(observerCtx, s, { kind: "stop", stop: outcome.stop }, session);
+	// A clean `stop` whose text carries raw tool-call markup never executed that call —
+	// the turn died mid-action. Retry ONCE in-session; a second leak is infra death.
+	if (hasLeakedToolMarkup(outcome.branch, offset)) {
+		if (markupLeakRetried.has(s))
+			return haltStageOrSoftHalt(
+				observerCtx,
+				s,
+				{ kind: "markupLeak", message: MSG_MARKUP_LEAK_FATAL(s.skill) },
+				session,
+			);
+		markupLeakRetried.add(s);
+		await resendIntoChild(child, MSG_MARKUP_LEAK_RETRY);
+		return postStage(observerCtx, child, s, offset);
+	}
 
 	const result = await produceAndValidateOutput(child, s, outcome.branch, offset);
 	if (result.kind === "fatal")
@@ -134,6 +158,24 @@ export async function postStage(
 	// observerCtx so the next stage's child is spawned off the launcher.
 	await s.onSuccess(observerCtx, result.output);
 }
+
+// ===========================================================================
+// MARKUP-LEAK RETRY — one in-session retry per activation (kata mykj)
+// ===========================================================================
+
+/** Activations that already spent their one markup-leak retry. Keyed off session
+ *  identity (the `bash-strikes.ts` WeakMap posture) so `StageSessionContext`
+ *  stays free of mutable accounting. */
+const markupLeakRetried = new WeakSet<StageSessionContext>();
+
+/** Model-facing steering resent into the child after a leaked tool call. */
+const MSG_MARKUP_LEAK_RETRY =
+	"Your last message contained raw tool-call markup as plain text, so that tool call was NOT executed. " +
+	"Re-issue it as a real tool call (do not paste markup into your reply), then finish the task.";
+
+/** Failed-row reason when the leak recurs after the retry. */
+const MSG_MARKUP_LEAK_FATAL = (skill: string) =>
+	`${skill}: session ended with leaked tool-call markup in its final message (the call never executed) after one in-session retry — treated as infra death`;
 
 // ===========================================================================
 // ABORT CLASSIFIER — postStage's single abort dispatch + its predicates
