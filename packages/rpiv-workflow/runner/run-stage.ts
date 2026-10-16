@@ -49,6 +49,7 @@ import {
 import { forkChildSession, reattachChildSession } from "../sessions/spawn.js";
 import type { SkillContractMap } from "../skill-contract.js";
 import { effectiveOutputSchemaOf } from "../stage-identity.js";
+import { singleStageModel } from "../stage-models.js";
 import type { WorkflowStage } from "../state/index.js";
 import type { RunContext, RunState, StageSessionContext, WorkflowHostContext } from "../types.js";
 import { resolveDigest } from "../worktree-digest.js";
@@ -207,7 +208,7 @@ function buildSingleStageSession(
 		skillContracts: run.skillContracts,
 		stageIndex: idx,
 		snapshot: prep.snapshot,
-		model: run.resolveModel?.({ workflow: run.workflow.name, stage: stage.name, skill: stage.skill }),
+		model: singleStageModel(run, stage.name, stage.skill),
 		signal: run.signal,
 		readSessionBranch: run.readSessionBranch,
 		worktreeDigest: run.worktreeDigest,
