@@ -108,6 +108,7 @@ export {
 	judge,
 	judgeShapeIssues,
 	type NamedOutcome,
+	type PanelFoldInfo,
 	type PanelJudge,
 	type PromptJudge,
 	panelMembers,
@@ -167,6 +168,7 @@ export {
 	workspaceDiffCollector,
 } from "./outcomes/index.js";
 export type { Output, OutputMeta, RunView, Verdict } from "./output.js";
+export { isFailedOutput } from "./output.js";
 // Producer-side surface — `output-spec.ts` is the ONE canonical import path
 // for collector/parser/outcome authoring types (`output.ts` keeps only the
 // envelope). `OutputSpec` is the deprecated pre-rename alias of `Outcome`.
