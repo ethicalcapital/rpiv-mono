@@ -40,7 +40,10 @@ type HaltReason =
 	// A watchdog aborted a runaway tool call (bash) past its per-command timeout. The
 	// host surfaces it via `WorkflowSessionContext.toolTimeout`; carries the operator-grade
 	// reason string written to the failed row (soft-halt errMsg / terminal errMsg).
-	| { kind: "timeout"; reason: string };
+	| { kind: "timeout"; reason: string }
+	// The turn ended `stop` but its text carried raw tool-call markup (the call never
+	// executed) — still leaked after the one in-session retry. Infra death (kata mykj).
+	| { kind: "markupLeak"; message: string };
 
 /**
  * Stop signals that witness an INFRA death — the child session never delivered
@@ -51,9 +54,12 @@ type HaltReason =
  *   - `toolUse`    — the transcript ENDS on a tool request: an agentic loop
  *                    truncated mid-flight, the signature of a killed child
  *                    process (the OOM killer's favourite).
- * `length` is deliberately absent: the model consumed its output budget — a
- * genuine model-behavior outcome an identical retry would likely reproduce, so
- * it stays a collected (semantic) failure for the downstream floors to judge.
+ * `length` is deliberately absent here: the model consumed its output budget, and
+ * an IDENTICAL retry would likely reproduce the cap — so a turn that hits the cap
+ * (again) stays a collected (semantic) failure for the downstream floors to judge.
+ * It reaches this set through no other path, though: `postStage` handles a first
+ * cap itself with ONE in-session continuation (kata kg4h), so only a turn that
+ * overruns AGAIN after being told to continue lands on this arm.
  * `aborted` never reaches the stop arm (`classifyAndHandleAbort` owns it and
  * throws `WorkflowAbortError` — no row, slot unfilled, resume re-dispatches).
  */
@@ -71,7 +77,8 @@ const INFRA_DEATH_STOPS: ReadonlySet<StopSignal> = new Set(["error", "noResponse
  * tool call) was judged — an identical retry is not obviously better, and the
  * deterministic floors downstream are the right judge.
  */
-const isInfraDeath = (reason: HaltReason): boolean => reason.kind === "stop" && INFRA_DEATH_STOPS.has(reason.stop);
+const isInfraDeath = (reason: HaltReason): boolean =>
+	reason.kind === "markupLeak" || (reason.kind === "stop" && INFRA_DEATH_STOPS.has(reason.stop));
 
 /**
  * The single collect-all fork. A `collectAll` fanout unit soft-halts a
@@ -106,6 +113,8 @@ function softHaltReason(s: StageSessionContext, reason: HaltReason): string {
 			return reason.failureSummary;
 		case "timeout":
 			return reason.reason;
+		case "markupLeak":
+			return reason.message;
 	}
 }
 
@@ -127,6 +136,8 @@ function failFastHalt(
 			// A non-fan-out stage whose bash overran the watchdog: terminal "failed" row whose
 			// errMsg carries the timeout reason (same shape as an extraction-fatal halt).
 			return haltStageWithExtractionError(ctx, s, reason.reason, session);
+		case "markupLeak":
+			return haltStageWithExtractionError(ctx, s, reason.message, session);
 	}
 }
 

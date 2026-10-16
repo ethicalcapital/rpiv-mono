@@ -36,6 +36,7 @@ import { isPanel, type Judge, type PanelJudge, panelMembers, resolveJudgePrompt 
 import { MSG_LOOP_CURSOR_CORRUPT } from "./messages.js";
 import { finalizeOutput, isFailedOutput, type Output, type OutputMeta } from "./output.js";
 import { invariantPreflight } from "./stage-errors.js";
+import { unitModel } from "./stage-models.js";
 import type { RunContext, RunState, StageSessionContext, UnitRef, WorkflowHostContext } from "./types.js";
 
 // ---------------------------------------------------------------------------
@@ -135,6 +136,16 @@ export interface LoopDeps {
 		run: RunContext,
 		e: Pick<LoopEntry, "name" | "skill">,
 		failed: number,
+		total: number,
+	) => Promise<void>;
+	/** Record the terminal hole halt (FAIL_FANOUT_HOLE) — same recording shape as
+	 *  `haltLoopWhenAllFailed`, fired when a generation closes with ANY failed
+	 *  slot under the default `onHole: "halt"`. */
+	haltLoopOnHole: (
+		hostCtx: WorkflowHostContext,
+		run: RunContext,
+		e: Pick<LoopEntry, "name" | "skill">,
+		failedLabels: readonly string[],
 		total: number,
 	) => Promise<void>;
 	/** Record a mid-flight run abort at the loop seam (FAIL_WORKFLOW_ABORTED).
@@ -281,7 +292,10 @@ const PANEL_VERDICT_KIND = "panel-verdict";
  * fold publishes data, member reasoning lives on member channels).
  */
 function foldPanelVerdict(panel: PanelJudge, verdicts: readonly Output[], meta: OutputMeta): Output {
-	return finalizeOutput({ kind: PANEL_VERDICT_KIND, artifacts: [], data: panel.fold(verdicts) }, meta);
+	return finalizeOutput(
+		{ kind: PANEL_VERDICT_KIND, artifacts: [], data: panel.fold(verdicts, { members: panel.members.length }) },
+		meta,
+	);
 }
 
 /**
@@ -494,6 +508,23 @@ export const allFanoutSlotsFailed = (cursor: LoopCursor): boolean =>
 	cursor.filledCount === cursor.slots.length &&
 	lastNonFailedSlot(cursor.slots) === undefined;
 
+/** Labels of the FILLED slots holding a failed sentinel (the holes), in declared
+ *  order; empty when the generation is whole. Unfilled slots (over-cap advance,
+ *  pending) are not holes. A sentinel's label is the unit's `dimension`/label
+ *  when it carries one, else its 1-based slot number. */
+export const failedFanoutSlotLabels = (cursor: LoopCursor): string[] =>
+	(cursor.slots ?? []).flatMap((o, i) => {
+		if (o === undefined || !isFailedOutput(o)) return [];
+		const dimension = (o.data as { dimension?: unknown } | undefined)?.dimension;
+		return [typeof dimension === "string" ? dimension : `#${i + 1}`];
+	});
+
+/** THE hole-halt narrow — `true` for a collect-all fanout whose `onHole` is not
+ *  `"continue"` (the default halts). `failFast` loops are excluded: the first
+ *  failure already halted, so no close ever sees a hole. */
+export const isHaltOnHole = (loop: LoopDef): boolean =>
+	loop.kind === "fanout" && loop.failFast !== true && loop.onHole !== "continue";
+
 /** THE fanout fail-fast narrow — `true` when a fanout loop opted out of the
  *  default collect-all via `fanout({ failFast: true })`. The ONE spelling of the
  *  kind+field guard the dispatcher (sibling-cancel) and `buildUnitSession`
@@ -554,7 +585,16 @@ export function buildUnitSession(
 		snapshot,
 		branchOffset: undefined,
 		unit: { parent: e.name, role: u.role, index, id: u.id, label: u.label },
-		model: run.resolveModel?.({ workflow: run.workflow.name, stage: e.name, skill: u.skill }),
+		// Pin → run resolver → host default; an assess/verify produce round after a failed
+		// verdict climbs the pack's escalation ladder (recorded as a run-log row).
+		model: unitModel(run, {
+			stage: e.name,
+			skill: u.skill,
+			unitLabel: u.label,
+			loopKind: e.loop.kind,
+			role: u.role,
+			round: index,
+		}),
 		signal,
 		readSessionBranch: run.readSessionBranch,
 		worktreeDigest: run.worktreeDigest,

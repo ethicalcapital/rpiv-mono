@@ -23,9 +23,16 @@
  *                          exported below instead of duplicating them.
  */
 
-import { WorkflowAbortError } from "../internal-utils.js";
+import { WorkflowAbortError, WorkflowParkedError } from "../internal-utils.js";
 import type { SessionRef } from "../state/index.js";
-import { type BranchEntry, classifyStop, readBranch, readSessionRef, type StopSignal } from "../transcript.js";
+import {
+	type BranchEntry,
+	classifyStop,
+	hasLeakedToolMarkup,
+	readBranch,
+	readSessionRef,
+	type StopSignal,
+} from "../transcript.js";
 import type { StageSessionContext, WorkflowHostContext, WorkflowSessionContext } from "../types.js";
 import { bashStrikesRemaining, bashTimeoutSteeringMessage, consumeBashStrike } from "./bash-strikes.js";
 import { produceAndValidateOutput } from "./extraction.js";
@@ -39,6 +46,8 @@ import { recordStageSuccess } from "./success-persist.js";
 
 /** Execute one DAG stage (or loop unit) in its own detached child session. */
 export async function executeStageSession(ctx: WorkflowHostContext, s: StageSessionContext): Promise<void> {
+	// Open the stage window: collectors accept only artifacts written after this (kata mykj).
+	s.stageStartedAtMs ??= Date.now();
 	await spawnChildAndRun(ctx, s, (child) => postStage(ctx, child, s));
 }
 
@@ -62,6 +71,7 @@ export async function continueStageSession(
 	s: StageSessionContext,
 ): Promise<void> {
 	const offset = readBranch(child).length;
+	s.stageStartedAtMs ??= Date.now();
 	await resendIntoChild(child, s.prompt);
 	await postStage(observerCtx, child, s, offset);
 }
@@ -107,6 +117,17 @@ export async function postStage(
 	// surfaces as "error"/"toolUse", not "aborted" — so the stop/halt arms below
 	// only ever see turns with no live watchdog verdict.
 	if ((await classifyAndHandleAbort(observerCtx, child, s, outcome, session, offset)) === "continue") return;
+	// A turn cut off at the model's output-length cap was NOT judged bad — it was
+	// interrupted mid-reply, so its text is incomplete and any tool call it was
+	// mid-way through never landed. Steer it ONCE to continue where it stopped
+	// (kata kg4h); only a turn that hits the cap AGAIN after being told to
+	// continue is the genuine `length` outcome the halt gate below judges.
+	if (outcome.stop === "length") {
+		if (lengthContinued.has(s)) return haltStageOrSoftHalt(observerCtx, s, { kind: "stop", stop: "length" }, session);
+		lengthContinued.add(s);
+		await resendIntoChild(child, MSG_LENGTH_CONTINUE);
+		return postStage(observerCtx, child, s, offset);
+	}
 	// Every halt below routes through the single `haltStageOrSoftHalt` gate: a
 	// fanout unit marked `collectAll` records a NON-terminal failed row + a sentinel
 	// slot instead of halting the run — EXCEPT an infra-death stop (error/noResponse/
@@ -116,6 +137,20 @@ export async function postStage(
 	// child is disposed when the stage ends.
 	if (outcome.stop !== "stop")
 		return haltStageOrSoftHalt(observerCtx, s, { kind: "stop", stop: outcome.stop }, session);
+	// A clean `stop` whose text carries raw tool-call markup never executed that call —
+	// the turn died mid-action. Retry ONCE in-session; a second leak is infra death.
+	if (hasLeakedToolMarkup(outcome.branch, offset)) {
+		if (markupLeakRetried.has(s))
+			return haltStageOrSoftHalt(
+				observerCtx,
+				s,
+				{ kind: "markupLeak", message: MSG_MARKUP_LEAK_FATAL(s.skill) },
+				session,
+			);
+		markupLeakRetried.add(s);
+		await resendIntoChild(child, MSG_MARKUP_LEAK_RETRY);
+		return postStage(observerCtx, child, s, offset);
+	}
 
 	const result = await produceAndValidateOutput(child, s, outcome.branch, offset);
 	if (result.kind === "fatal")
@@ -134,6 +169,42 @@ export async function postStage(
 	// observerCtx so the next stage's child is spawned off the launcher.
 	await s.onSuccess(observerCtx, result.output);
 }
+
+// ===========================================================================
+// OUTPUT-CAP CONTINUATION — one in-session nudge per activation (kata kg4h)
+// ===========================================================================
+
+/** Activations that already spent their one output-cap continuation. Keyed off
+ *  session identity (the `markupLeakRetried` / `bash-strikes.ts` posture) so
+ *  `StageSessionContext` stays free of mutable accounting. */
+const lengthContinued = new WeakSet<StageSessionContext>();
+
+/** Model-facing steering resent into the child after it hit the output cap.
+ *  Names the failure, forbids repeating the prefix, and — the point of the
+ *  ticket — tells the model to write a long artifact in PARTS so the retry does
+ *  not simply hit the same cap. */
+const MSG_LENGTH_CONTINUE =
+	"Your previous reply was cut off by the model's output-length cap, so it is incomplete and any action it was mid-way through did not complete. " +
+	"Continue the task from exactly where you were cut off — do not repeat what you already wrote. " +
+	"If the rest is another large artifact (a long document, a full file), write it in parts across several turns so the whole thing fits.";
+
+// ===========================================================================
+// MARKUP-LEAK RETRY — one in-session retry per activation (kata mykj)
+// ===========================================================================
+
+/** Activations that already spent their one markup-leak retry. Keyed off session
+ *  identity (the `bash-strikes.ts` WeakMap posture) so `StageSessionContext`
+ *  stays free of mutable accounting. */
+const markupLeakRetried = new WeakSet<StageSessionContext>();
+
+/** Model-facing steering resent into the child after a leaked tool call. */
+const MSG_MARKUP_LEAK_RETRY =
+	"Your last message contained raw tool-call markup as plain text, so that tool call was NOT executed. " +
+	"Re-issue it as a real tool call (do not paste markup into your reply), then finish the task.";
+
+/** Failed-row reason when the leak recurs after the retry. */
+const MSG_MARKUP_LEAK_FATAL = (skill: string) =>
+	`${skill}: session ended with leaked tool-call markup in its final message (the call never executed) after one in-session retry — treated as infra death`;
 
 // ===========================================================================
 // ABORT CLASSIFIER — postStage's single abort dispatch + its predicates
@@ -205,7 +276,8 @@ export async function classifyAndHandleAbort(
 	}
 	// Level 4 — an aborted stop with the signal cold and no watchdog is a genuine abort
 	// (e.g. ESC): throw so no row lands and resume re-dispatches the unit cleanly.
-	if (isAbortedStop(outcome)) throw new WorkflowAbortError();
+	// A parked question is the same stop, worded as a wait rather than an abort.
+	if (isAbortedStop(outcome)) throw child.parked?.() ? new WorkflowParkedError() : new WorkflowAbortError();
 	// Level 5 — a non-clean, non-abort stop with no verdict: the caller's stop arm owns it.
 }
 

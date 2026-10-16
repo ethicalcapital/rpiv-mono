@@ -59,7 +59,7 @@ Without the global install, `rpiv-wf` is
 | Flag | Default | |
 | --- | --- | --- |
 | `--name <name>` | workflow name | name the run; resume it by name |
-| `--model <id>` | Claude Code's | model for every stage (`haiku`, `sonnet`, `claude-opus-5-5`, …) |
+| `--model <id>` | Claude Code's | default model for every stage (`haiku`, `sonnet`, `claude-opus-5-5`, …); a pack's `models.stages` pin overrides it |
 | `--concurrency <n>` | `4` | parallel fan-out units |
 | `--permission-mode <mode>` | `auto` | Claude Code permission mode for each stage |
 | `--plugin-dir <dir>` | `rpiv-pi/hosts/claude` | the rpiv Claude plugin |
@@ -68,8 +68,14 @@ Without the global install, `rpiv-wf` is
 | `--tools <a,b>` | all | built-in tools stages may use (`none` = no built-ins) |
 | `--disallowed-tools <a,b>` | none | tools removed from every stage |
 | `--setting-sources <a,b>` | `user,project,local` | what loads, CLAUDE.md included (`none` = nothing) |
-| `--max-cost <usd>` | none | stop once this invocation has cost this much |
-| `--timeout <minutes>` | none | stop this invocation after this long |
+| `--max-cost <usd>` | none | stop once the run has cost this much, across resumes |
+| `--timeout <minutes>` | none | stop once the run has run this long, across resumes |
+| `--stage-max-cost <usd>` | none | stop once any one stage has cost this much |
+| `--stage-max-tokens <n>` | none | stop once any one stage has used this many tokens |
+| `--park-confirmations` | off | park routine confirmations too, instead of taking their (Recommended) option |
+| `--auto-accept-checkpoints` | off | let human-checkpoint stages (build's `design-review`) pass without a person; logged in the run log |
+| `--kata <ref>` | none | file parked-question tickets under this phase ticket |
+| `--kata-labels <a,b>` | `rpiv-parked,human` | labels for parked-question tickets (`none` = no labels) |
 
 | Exit | Means | Next |
 | --- | --- | --- |
@@ -77,7 +83,7 @@ Without the global install, `rpiv-wf` is
 | `1` | failed (a stage or gate failed) | read the log; `resume` retries the failed stage |
 | `2` | usage error | |
 | `75` | parked: a stage is waiting on an answer | `inbox`, then `answer` |
-| `76` | stopped at `--max-cost` | `resume` |
+| `76` | stopped at a cost or token cap | `resume` |
 | `124` | stopped at `--timeout` | `resume` |
 | `130` | interrupted (Ctrl-C / SIGTERM) | `resume` |
 
@@ -98,9 +104,15 @@ evals that survive a crash. What to set:
   asking. Questions still park (exit 75); they never hang. The SDK prints a
   `CLAUDE_SDK_CAN_USE_TOOL_SHADOWED` warning in this mode; it is expected
   (the callback still sees `AskUserQuestion`, which is all parking needs).
-- **Caps.** `--max-cost` and `--timeout` cover one invocation. A run resumed
-  three times can spend three caps, so a wrapper that resumes in a loop must
-  keep its own total (the metrics file has it). At the cost cap, turns already
+- **Caps.** Every stage turn appends a `usage` row (tokens always; cost only
+  when the SDK reports one, never an invented price) to the run's JSONL, and
+  each invocation appends an `invocation` row (`run`, `resumed`, `end`) and
+  exactly one `terminal` row (`completed`, `failed`, `parked` or `aborted`,
+  with the reason), written from an exit handler when the run never returns. So
+  `--max-cost`, `--timeout` and the per-stage caps count what earlier
+  invocations of the run spent. Through a gateway the SDK reports no cost;
+  `--max-cost` then warns that it cannot be enforced, and the token caps are
+  the ones that bind. At the cost cap, turns already
   running finish and their work is kept; no new turn starts. A run therefore
   ends somewhat over its cap, by what was in flight, and if that was its last
   stage it completes (exit 0). The timeout cuts running turns off; the
@@ -110,6 +122,14 @@ evals that survive a crash. What to set:
   Anthropic-compatible endpoint (a variant `env` of `ANTHROPIC_BASE_URL` and
   `ANTHROPIC_AUTH_TOKEN`, which Claude Code honours) should work but are
   **not verified** here; try one trial with `--max-cost` first.
+- **Per-stage models.** A pack sets them on the workflow:
+  `models: { stages: { plan: "haiku", synthesize: "opus" }, escalate: { ladder: ["haiku", "sonnet", "opus"] } }`.
+  With a ladder, a producer whose verify/assess verdict failed retries one
+  step up per failed round; each step is a `model-escalation` row in the run
+  log. A grade → fix back-edge (build's `plan-fix`, `code-fix`) escalates
+  through `escalate.revisits: ["plan-fix", "code-fix"]`: the first fix runs on
+  the stage's pin, each repeat lap one step up. Ids compare as exact strings,
+  so write pins and ladder the same way.
 - **Detach it.** `tmux`, or `nohup rpiv-wf … > night.log 2>&1 &`. Progress
   goes to stderr; the run log in `.rpiv/workflows/runs/` is the record.
 - **Morning.** `rpiv-wf inbox` for parked questions; failed and stopped runs
@@ -163,12 +183,15 @@ A stage that needs a person does not guess. When a skill calls
 1. The question and its options are saved beside the run log, in
    `.rpiv/workflows/runs/<run-id>.parked.json`. The run log itself keeps
    upstream's format.
-2. If `kata` is on PATH, a ticket is filed and labelled `rpiv-parked`, with the
-   answer command in its body. Not `human` or `decision`: monocloud's hourly
-   producer copies those two labels into `activity.timeline`, and parked
-   questions stay out of the database for now. `RPIV_WF_KATA=off` disables it;
+2. If `kata` is on PATH, a ticket is filed with the answer command in its
+   body, labelled `rpiv-parked` and `human` (monocloud's hourly producer copies
+   `human` onto `activity.timeline`). `--kata-labels a,b` (or
+   `RPIV_WF_KATA_LABELS`) replaces the labels, `none` files none; `--kata <ref>`
+   files each park under that phase ticket. `RPIV_WF_KATA=off` disables kata;
    any kata failure is a warning, never a stop.
-3. The run stops cleanly and `rpiv-wf` exits `75`.
+3. The run soft-stops: stages and fan-out units already running finish and are
+   kept, no new turn starts, and `rpiv-wf` exits `75`. The park records the
+   stage that asked.
 
 `rpiv-wf inbox` lists every waiting question in the project, oldest first.
 `rpiv-wf answer <run> <n> <choice>` takes an option number, a label, or free
@@ -179,9 +202,21 @@ and receives the answer, so the work it did before asking is kept.
 Run in passes: start or resume several runs, let each go until it finishes or
 parks, then work through the inbox.
 
+A routine confirmation does not park: when every question is single-select
+with exactly one (Recommended) option (for example "Write the research doc?
+Write it (Recommended) / Keep scanning"), rpiv-wf answers with those options
+and records a `confirmation-auto-accepted` row in the run log. Anything else
+is a decision and parks. `--park-confirmations` parks them all. A parked
+stage is reported as parked, not as an aborted or failed run.
+
+A stage marked `checkpoint: true` (build's `design-review`) is a human
+checkpoint: its questions always park, and a checkpoint that completes
+without a person's answer fails. `--auto-accept-checkpoints` lets it pass
+with its (Recommended) option, recorded as a `checkpoint-auto-accepted` row
+in the run log.
+
 Limits: one question is answered per park (a multi-question AskUserQuestion
-takes one free-text answer covering all of them); a park stops the whole run,
-so fan-out units still in flight are re-run on resume; parking needs the
+takes one free-text answer covering all of them); parking needs the
 Claude Code host (Pi has its own in-session parking in the lane console).
 
 ## Steps: one skill, full guarantees

@@ -29,10 +29,11 @@ import { resolve } from "node:path";
 import { parseArgs } from "node:util";
 import type { RunWorkflowResult, WorkflowHostContext } from "@juicesharp/rpiv-workflow";
 import { type ClaudeHostDeps, ClaudeWorkflowHost } from "./claude-host.js";
-import { detectKata, type Kata } from "./kata.js";
+import { detectKata, type Kata, type KataOptions } from "./kata.js";
 import { formatPark, openParks, readParks, resolveChoice, resolveRunId, updatePark } from "./park-store.js";
 import { createRunParking } from "./parking.js";
 import { registerRpivWorkflowSupport } from "./rpiv-support.js";
+import { mergeLifecycles, RunLedger } from "./run-ledger.js";
 import { defaultPluginDir, loadSkillCatalog, skillRegistryHost } from "./skills.js";
 import { registerStep, STEP_PREFIX, stepSkill, stepSkills, stepWorkflowName } from "./steps.js";
 import { addTurn, emptyTotals, listFlag } from "./usage.js";
@@ -69,14 +70,23 @@ options:
   --tools <a,b,...>          built-in tools stages may use (none = no built-ins)
   --disallowed-tools <a,b>   tools removed from every stage
   --setting-sources <a,b>    user,project,local (default all; none = no settings or CLAUDE.md memory)
-  --max-cost <usd>           stop the run once it has cost this much (exit 76, resumable)
-  --timeout <minutes>        stop the run after this long (exit 124, resumable)
+  --max-cost <usd>           stop the run once it has cost this much in total, across resumes (exit 76, resumable)
+  --timeout <minutes>        stop the run once it has run this long in total, across resumes (exit 124, resumable)
+  --stage-max-cost <usd>     stop the run once any one stage has cost this much (exit 76)
+  --stage-max-tokens <n>     stop the run once any one stage has used this many tokens (exit 76)
   --no-resume                answer: record the answer without resuming the run
+  --park-confirmations       park routine confirmations too (default: take their (Recommended) option, logged)
+  --auto-accept-checkpoints  let human-checkpoint stages pass without a person (logged in the run log)
+  --kata <ref>               file each parked question's ticket under this phase ticket
+  --kata-labels <a,b>        labels for parked-question tickets (default rpiv-parked,human)
 
 <choice> is an option number, an option label, or free text.
 
 exit codes: 0 completed, 1 failed, 2 usage, 75 parked (answer it), 76 stopped at
---max-cost, 124 stopped at --timeout, 130 interrupted. Stopped runs resume.`;
+a cost/token cap, 124 stopped at --timeout, 130 interrupted. Stopped runs resume.
+
+Usage (tokens always, cost when the SDK reports one) is written to the run's
+JSONL as one row per stage turn, so caps count what earlier invocations spent.`;
 
 export interface CliIo {
 	out: (line: string) => void;
@@ -126,6 +136,43 @@ async function defaultDeps(): Promise<ClaudeHostDeps> {
 	return { query: sdk.query, forkSession: sdk.forkSession };
 }
 
+/** Exit codes a stop signal ends the process with (128 + signal number). */
+const SIGNAL_EXIT = { SIGINT: 130, SIGTERM: 143, SIGHUP: 129 } as const;
+
+/**
+ * The first SIGINT, SIGTERM or SIGHUP asks the run to stop resumably (it then
+ * ends through the normal path and writes its terminal row). A second one
+ * exits now with 128 + the signal number; `process.exit` still fires `exit`,
+ * so the ledger's exit handler writes the terminal row. Without a listener,
+ * Node dies on these signals without emitting `exit` at all (kata grt7).
+ */
+export function handleStopSignals(
+	controller: AbortController,
+	proc: { on(event: string, fn: () => void): unknown; exit(code: number): void } = process,
+): void {
+	for (const [sig, code] of Object.entries(SIGNAL_EXIT)) {
+		proc.on(sig, () => {
+			if (controller.signal.aborted) proc.exit(code);
+			else controller.abort();
+		});
+	}
+}
+
+/** True when `code` is the exit a stop signal produces. */
+const isSignalExit = (code: number): boolean => Object.values(SIGNAL_EXIT).some((c) => c === code);
+
+/** Why a process exit code ended a run that never returned. */
+function exitReason(code: number): string {
+	const sig = Object.entries(SIGNAL_EXIT).find(([, c]) => c === code)?.[0];
+	return `process exited (code ${code}${sig ? `, ${sig}` : ""}) before the run returned`;
+}
+
+/** Register a process `exit` listener; returns its removal. */
+const onProcessExit = (fn: (code: number) => void): (() => void) => {
+	process.on("exit", fn);
+	return () => process.off("exit", fn);
+};
+
 function report(result: RunWorkflowResult, io: CliIo): number {
 	const where = result.runId ? ` (run ${result.runId})` : "";
 	if (result.success) {
@@ -145,7 +192,11 @@ export async function main(
 		deps?: ClaudeHostDeps;
 		signal?: AbortSignal;
 		kata?: Kata | null;
+		/** Builds the kata client when `kata` is not injected (tests). */
+		detectKata?: typeof detectKata;
 		metricsFile?: string;
+		/** Registers the process `exit` listener that writes a terminal row for a run that never returns (tests). */
+		onExit?: (fn: (code: number) => void) => () => void;
 	} = {},
 ): Promise<number> {
 	let parsed: ReturnType<
@@ -173,8 +224,14 @@ export async function main(
 				out: { type: "string" },
 				"max-cost": { type: "string" },
 				timeout: { type: "string" },
+				"stage-max-cost": { type: "string" },
+				"stage-max-tokens": { type: "string" },
 				continue: { type: "string" },
 				"dry-run": { type: "boolean" },
+				kata: { type: "string" },
+				"auto-accept-checkpoints": { type: "boolean" },
+				"park-confirmations": { type: "boolean" },
+				"kata-labels": { type: "string" },
 				help: { type: "boolean", short: "h" },
 			},
 		});
@@ -197,6 +254,8 @@ export async function main(
 		out?: string;
 		"max-cost"?: string;
 		timeout?: string;
+		"stage-max-cost"?: string;
+		"stage-max-tokens"?: string;
 		continue?: string;
 		"dry-run"?: boolean;
 		help?: boolean;
@@ -215,9 +274,13 @@ export async function main(
 	}
 	const maxCost = values["max-cost"] === undefined ? undefined : Number(values["max-cost"]);
 	const timeoutMin = values.timeout === undefined ? undefined : Number(values.timeout);
+	const stageMaxCost = values["stage-max-cost"] === undefined ? undefined : Number(values["stage-max-cost"]);
+	const stageMaxTokens = values["stage-max-tokens"] === undefined ? undefined : Number(values["stage-max-tokens"]);
 	for (const [flag, v] of [
 		["--max-cost", maxCost],
 		["--timeout", timeoutMin],
+		["--stage-max-cost", stageMaxCost],
+		["--stage-max-tokens", stageMaxTokens],
 	] as const) {
 		if (v !== undefined && !(Number.isFinite(v) && v > 0)) {
 			io.err(`${flag} must be a positive number\n${USAGE}`);
@@ -272,7 +335,14 @@ export async function main(
 	}
 
 	const warn = (m: string) => io.err(`[warning] ${m}`);
-	const kata = inject.kata === undefined ? detectKata(warn) : (inject.kata ?? undefined);
+	const kataOpts: KataOptions = {
+		...(typeof values["kata-labels"] === "string" ? { labels: listFlag(values["kata-labels"]) ?? [] } : {}),
+		...(typeof values.kata === "string" ? { parent: values.kata } : {}),
+	};
+	const kata =
+		inject.kata === undefined
+			? (inject.detectKata ?? detectKata)(warn, undefined, undefined, kataOpts)
+			: (inject.kata ?? undefined);
 	let resumeRef = target;
 	if (command === "answer") {
 		const runId = resolveRunId(cwd, target!);
@@ -333,18 +403,47 @@ export async function main(
 		// A budget stop lets running turns finish (their work is kept); a timeout cuts them off.
 		(why === "budget" ? halt : stop).abort();
 	};
+	const priorRunId = command === "run" || command === "step" ? undefined : resolveRunId(cwd, resumeRef!);
+	const ledger = new RunLedger(cwd, priorRunId ? "resumed" : "run", priorRunId);
+	// Every invocation ends with a terminal row, even one that never returns (kata grt7).
+	const offExit = (inject.onExit ?? onProcessExit)((code) =>
+		ledger.terminal(isSignalExit(code) ? "aborted" : "failed", exitReason(code), code),
+	);
+	// --timeout counts the wall-clock earlier invocations of this run already used.
 	const timer =
 		timeoutMin === undefined
 			? undefined
-			: setTimeout(() => stopFor("timeout", `--timeout ${timeoutMin} min reached`), timeoutMin * 60_000);
+			: setTimeout(
+					() => stopFor("timeout", `--timeout ${timeoutMin} min reached`),
+					Math.max(0, timeoutMin * 60_000 - ledger.totals.elapsedMs),
+				);
 	timer?.unref();
+	let costUnreportedWarned = false;
+	const checkCaps = (stage: string | undefined) => {
+		const t = ledger.totals;
+		if (maxCost !== undefined && t.costReported && t.costUsd >= maxCost) {
+			stopFor("budget", `--max-cost $${maxCost} reached ($${t.costUsd.toFixed(4)} across the run)`);
+		}
+		if (maxCost !== undefined && !t.costReported && t.tokens > 0 && !costUnreportedWarned) {
+			costUnreportedWarned = true;
+			warn("--max-cost cannot be enforced: the SDK reports no cost for these turns (tokens are still recorded)");
+		}
+		const s = stage === undefined ? undefined : t.stages[stage];
+		if (s && stageMaxCost !== undefined && s.costUsd >= stageMaxCost) {
+			stopFor("budget", `stage "${stage}" reached --stage-max-cost $${stageMaxCost} ($${s.costUsd.toFixed(4)})`);
+		}
+		if (s && stageMaxTokens !== undefined && s.tokens >= stageMaxTokens) {
+			stopFor("budget", `stage "${stage}" reached --stage-max-tokens ${stageMaxTokens} (${s.tokens})`);
+		}
+	};
 	inject.signal?.addEventListener("abort", () => stop.abort(), { once: true });
 	if (inject.signal?.aborted) stop.abort();
 	const runParking = createRunParking({
 		cwd,
-		runId: command === "run" || command === "step" ? undefined : resolveRunId(cwd, resumeRef!),
+		runId: priorRunId,
 		kata,
-		stop: () => stop.abort(),
+		// Soft stop: siblings already running finish and are kept; no new turn starts.
+		stop: () => halt.abort(),
 		notify: (m) => io.err(`[info] ${m}`),
 	});
 	const host = new ClaudeWorkflowHost(
@@ -359,15 +458,16 @@ export async function main(
 			halt: halt.signal,
 			notify: (m, l = "info") => io.err(`[${l}] ${m}`),
 			parking: runParking.parking,
+			...(values["auto-accept-checkpoints"] === true ? { autoAcceptCheckpoints: true } : {}),
+			autoAcceptConfirmations: values["park-confirmations"] !== true,
 			...(values.effort ? { effort: values.effort as Effort } : {}),
 			...(values.tools !== undefined ? { tools: listFlag(values.tools) } : {}),
 			...(values["disallowed-tools"] !== undefined ? { disallowedTools: listFlag(values["disallowed-tools"]) } : {}),
 			...(settingSources ? { settingSources: settingSources as SettingSource[] } : {}),
-			onUsage: (u) => {
+			onUsage: (u, info = { sessionId: "" }) => {
 				addTurn(totals, u);
-				if (maxCost !== undefined && totals.costUsd >= maxCost) {
-					stopFor("budget", `--max-cost $${maxCost} reached ($${totals.costUsd.toFixed(4)})`);
-				}
+				ledger.record(u, info);
+				checkCaps(info.stage);
 			},
 		},
 		inject.deps ?? (await defaultDeps()),
@@ -375,35 +475,56 @@ export async function main(
 	const opts = {
 		host: skillRegistryHost(catalog),
 		signal: stop.signal,
-		lifecycle: runParking.lifecycle,
+		lifecycle: mergeLifecycles(ledger.lifecycle, runParking.lifecycle),
 		trigger: { kind: "programmatic", source: "rpiv-praxis" },
 		...(values.name ? { name: values.name } : {}),
+		// --model is every stage's default; a pack's per-stage pin overrides it, and
+		// its escalation ladder climbs from it (the engine must see it to do either).
+		...(values.model ? { resolveModel: () => ({ model: values.model as string }) } : {}),
 	};
-	const result =
-		command === "run" || command === "step"
-			? await api.runWorkflowByName(
-					host,
-					command === "step" ? stepWorkflowName(target!) : target!,
-					rest.join(" "),
-					opts,
-				)
-			: await api.resumeWorkflowByRunId(host, resumeRef!, opts);
+	let result: RunWorkflowResult;
+	try {
+		result =
+			command === "run" || command === "step"
+				? await api.runWorkflowByName(
+						host,
+						command === "step" ? stepWorkflowName(target!) : target!,
+						rest.join(" "),
+						opts,
+					)
+				: await api.resumeWorkflowByRunId(host, resumeRef!, opts);
+	} catch (err) {
+		ledger.terminal("failed", `rpiv-wf threw: ${err instanceof Error ? err.message : String(err)}`, EXIT.failed);
+		offExit();
+		throw err;
+	}
 	if (timer) clearTimeout(timer);
+	ledger.end();
 	const parked = runParking.parked();
 	let code: number;
 	if (parked.length > 0) {
 		for (const p of parked) io.out(formatPark(p));
 		io.out(`parked: answer with \`rpiv-wf answer ${parked[0]!.runId} ${parked[0]!.n} <choice>\``);
 		code = EXIT.parked;
+		ledger.terminal(
+			"parked",
+			parked.map((p) => `${p.stage ?? "stage"}: ${p.questions[0]?.question ?? "a question"}`).join("; "),
+			code,
+		);
 	} else if (limit && !(limit === "budget" && result.success)) {
 		io.err(`stopped (${limit})${result.runId ? ` — run ${result.runId}` : ""}`);
 		code = limit === "budget" ? EXIT.budget : EXIT.timeout;
+		ledger.terminal("aborted", `stopped at the ${limit} limit`, code);
 	} else if (inject.signal?.aborted) {
 		io.err("interrupted");
 		code = EXIT.interrupted;
+		ledger.terminal("aborted", "interrupted by a stop signal", code);
 	} else {
 		code = report(result, io);
+		if (result.success) ledger.terminal("completed", `${result.stagesCompleted} stage(s)`, code);
+		else ledger.terminal("failed", result.error ?? "unknown error", code);
 	}
+	offExit();
 	writeMetrics(inject.metricsFile ?? process.env.RPIV_WF_METRICS_FILE, {
 		exitCode: code,
 		runId: result.runId ?? parked[0]?.runId ?? null,

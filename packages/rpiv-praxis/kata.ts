@@ -2,10 +2,11 @@
  * kata tickets for parked questions — optional, and never in the way.
  *
  * Active only when a `kata` executable is on PATH (set RPIV_WF_KATA=off to
- * opt out). A park files one ticket labelled `rpiv-parked`; answering closes
- * it. Deliberately NOT `human` or `decision`: monocloud's hourly producer
- * surfaces those two labels to activity.timeline, and parked questions stay
- * out of the database for now.
+ * opt out). A park files one ticket; answering closes it. Labels default to
+ * `rpiv-parked` plus `human`: the CIO decided on 2026-10-15 that parked
+ * questions surface on activity.timeline, and monocloud's hourly producer
+ * picks up `human`. Override with --kata-labels (or RPIV_WF_KATA_LABELS).
+ * `--kata <ref>` files each park under that phase ticket (`--parent`).
  *
  * Every failure is reported and swallowed: a missing or broken kata must
  * never stop a question from parking or an answer from resuming.
@@ -17,6 +18,15 @@ import { delimiter, join } from "node:path";
 import type { Park } from "./park-store.js";
 
 export const KATA_LABEL = "rpiv-parked";
+/** Labels a park's ticket carries unless configured otherwise. */
+export const DEFAULT_KATA_LABELS: readonly string[] = [KATA_LABEL, "human"];
+
+export interface KataOptions {
+	/** Labels for each park ticket (default `DEFAULT_KATA_LABELS`). */
+	labels?: readonly string[];
+	/** Phase ticket each park is filed under. */
+	parent?: string;
+}
 
 export type Exec = (cmd: string, args: string[], input?: string) => string;
 
@@ -67,6 +77,7 @@ export function ticketBody(park: Park, answerHint: string): string {
 		.join("\n\n");
 	return [
 		`rpiv workflow \`${park.workflow ?? "?"}\` parked at stage \`${park.stage ?? "?"}\` (run ${park.runId}, question #${park.n}).`,
+		...(park.context ? [`Context (what the stage wrote before asking):\n\n${park.context}`] : []),
 		qs,
 		`Answer with:\n\n    ${answerHint}`,
 	].join("\n\n");
@@ -77,8 +88,12 @@ export function detectKata(
 	warn: (m: string) => void,
 	exec: Exec = realExec,
 	env: NodeJS.ProcessEnv = process.env,
+	opts: KataOptions = {},
 ): Kata | undefined {
 	if (env.RPIV_WF_KATA === "off" || !onPath("kata", env)) return undefined;
+	const envLabels = env.RPIV_WF_KATA_LABELS?.split(",").map((l) => l.trim());
+	const labels = (opts.labels ?? envLabels ?? DEFAULT_KATA_LABELS).filter((l) => l.length > 0);
+	const extra = [...labels.flatMap((l) => ["--label", l]), ...(opts.parent ? ["--parent", opts.parent] : [])];
 	return {
 		file(park, answerHint) {
 			try {
@@ -90,19 +105,11 @@ export function detectKata(
 				const ref = refFrom(
 					exec(
 						"kata",
-						["create", title, "--priority", "2", "--body-stdin", "--json"],
+						["create", title, "--priority", "2", ...extra, "--body-stdin", "--json"],
 						ticketBody(park, answerHint),
 					),
 				);
-				if (!ref) {
-					warn("kata create returned no ticket ref; the question is still in `rpiv-wf inbox`");
-					return undefined;
-				}
-				try {
-					exec("kata", ["label", "add", ref, KATA_LABEL]);
-				} catch (err) {
-					warn(`kata label add ${ref} failed: ${String(err)}`);
-				}
+				if (!ref) warn("kata create returned no ticket ref; the question is still in `rpiv-wf inbox`");
 				return ref;
 			} catch (err) {
 				warn(`kata create failed: ${String(err)}; the question is still in \`rpiv-wf inbox\``);
@@ -112,7 +119,17 @@ export function detectKata(
 		close(park) {
 			if (!park.kata) return;
 			try {
-				exec("kata", ["close", park.kata, "--done", "--message", `Answered via rpiv-wf: ${park.answer ?? ""}`]);
+				// kata 0.18 refuses `--done` without typed evidence and with a message
+				// under 40 characters; the run/question pair is the evidence.
+				exec("kata", [
+					"close",
+					park.kata,
+					"--done",
+					"--message",
+					`Answered via rpiv-wf (run ${park.runId}, question #${park.n}): ${park.answer ?? "(no answer text)"}`,
+					"--evidence",
+					`external:rpiv-wf:${park.runId}#${park.n}`,
+				]);
 			} catch (err) {
 				warn(`kata close ${park.kata} failed: ${String(err)}`);
 			}

@@ -74,6 +74,18 @@ describe("rpiv-wf", () => {
 		expect(h.out).toEqual(["completed (run r9): 3 stage(s)", "artifact: plan.md"]);
 	});
 
+	it("--model reaches the engine as every stage's default model (kata rb2w)", async () => {
+		const h = harness();
+		expect(await h.go(["run", "build", "x", "--model", "sonnet", "--plugin-dir", plugin()])).toBe(EXIT.ok);
+		const opts = vi.mocked(h.api.runWorkflowByName).mock.calls[0]![3] as {
+			resolveModel?: (id: { workflow: string; stage: string; skill: string }) => unknown;
+		};
+		expect(opts.resolveModel?.({ workflow: "build", stage: "plan", skill: "plan" })).toEqual({ model: "sonnet" });
+		const bare = harness();
+		await bare.go(["run", "build", "x", "--plugin-dir", plugin()]);
+		expect(vi.mocked(bare.api.runWorkflowByName).mock.calls[0]![3]).not.toHaveProperty("resolveModel");
+	});
+
 	it("resumes by reference", async () => {
 		const h = harness();
 		expect(await h.go(["resume", "dm", "--plugin-dir", plugin(), "--concurrency", "2"])).toBe(EXIT.ok);
@@ -234,6 +246,89 @@ describe("rpiv-wf parked questions", () => {
 		expect(code).toBe(EXIT.parked);
 		expect(a.out.at(-1)).toBe("parked: answer with `rpiv-wf answer r9 1 <choice>`");
 		expect(readParks(cwd, "r9")).toHaveLength(1);
+	});
+
+	it("a park soft-stops the run: siblings finish, nothing new starts, the run is not aborted (kata 79yy)", async () => {
+		const cwd = project();
+		const h = harness({ success: false, stagesCompleted: 0, runId: "r9" });
+		let signals: { run?: AbortSignal; halt?: AbortSignal } = {};
+		vi.mocked(h.api.runWorkflowByName).mockImplementationOnce(async (ctx, _n, _i, opts) => {
+			const o = opts as { signal: AbortSignal; lifecycle: { onWorkflowStart(c: unknown): void } };
+			o.lifecycle.onWorkflowStart({ runId: "r9", workflow: "wf" });
+			const host = ctx as unknown as { opts: { halt: AbortSignal; parking: { park(i: unknown): void } } };
+			host.opts.parking.park({ prompt: "/skill:pick", sessionId: "s1", questions: [ask] });
+			signals = { run: o.signal, halt: host.opts.halt };
+			return { success: false, stagesCompleted: 0, runId: "r9" };
+		});
+		const code = await main(["run", "wf", "--cwd", cwd, "--plugin-dir", plugin()], io().io, {
+			api: h.api,
+			deps: { query: vi.fn(), forkSession: vi.fn() } as never,
+			kata: null,
+		});
+		expect(code).toBe(EXIT.parked);
+		expect(signals.halt?.aborted).toBe(true);
+		expect(signals.run?.aborted).toBe(false);
+	});
+
+	it("--auto-accept-checkpoints reaches the host; without it checkpoints need a person (kata ac4x)", async () => {
+		for (const [flag, want] of [
+			[["--auto-accept-checkpoints"], true],
+			[[], undefined],
+		] as const) {
+			const h = harness();
+			await main(["run", "wf", ...flag, "--cwd", project(), "--plugin-dir", plugin()], io().io, {
+				api: h.api,
+				deps: { query: vi.fn(), forkSession: vi.fn() } as never,
+				kata: null,
+			});
+			const ctx = vi.mocked(h.api.runWorkflowByName).mock.calls[0]![0] as unknown as {
+				opts: { autoAcceptCheckpoints?: boolean };
+			};
+			expect(ctx.opts.autoAcceptCheckpoints).toBe(want);
+		}
+	});
+
+	it("routine confirmations are auto-accepted unless --park-confirmations (kata 439b)", async () => {
+		for (const [flag, want] of [
+			[[], true],
+			[["--park-confirmations"], false],
+		] as const) {
+			const h = harness();
+			await main(["run", "wf", ...flag, "--cwd", project(), "--plugin-dir", plugin()], io().io, {
+				api: h.api,
+				deps: { query: vi.fn(), forkSession: vi.fn() } as never,
+				kata: null,
+			});
+			const ctx = vi.mocked(h.api.runWorkflowByName).mock.calls[0]![0] as unknown as {
+				opts: { autoAcceptConfirmations?: boolean };
+			};
+			expect(ctx.opts.autoAcceptConfirmations).toBe(want);
+		}
+	});
+
+	it("--kata and --kata-labels configure the park tickets", async () => {
+		const detect = vi.fn(() => undefined);
+		const h = harness();
+		await main(
+			[
+				"run",
+				"wf",
+				"--kata",
+				"ph42",
+				"--kata-labels",
+				"rpiv-parked,human,phase",
+				"--cwd",
+				project(),
+				"--plugin-dir",
+				plugin(),
+			],
+			io().io,
+			{ api: h.api, deps: { query: vi.fn(), forkSession: vi.fn() } as never, detectKata: detect },
+		);
+		expect(detect).toHaveBeenCalledWith(expect.any(Function), undefined, undefined, {
+			labels: ["rpiv-parked", "human", "phase"],
+			parent: "ph42",
+		});
 	});
 });
 

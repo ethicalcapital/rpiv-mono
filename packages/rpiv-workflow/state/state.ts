@@ -167,6 +167,22 @@ export interface WorkflowStage {
 }
 
 /**
+ * Telemetry row: a loop unit dispatched on a stronger model than its stage's
+ * base because the previous round's verdict failed (`Workflow.models.escalate`).
+ * No `stageNumber`, so the stage readers and the resume fold skip it.
+ */
+export interface ModelEscalationRow {
+	type: "model-escalation";
+	ts: string;
+	stage: string;
+	unit?: string;
+	round: number;
+	from: string | null;
+	to: string;
+	reason: string;
+}
+
+/**
  * Telemetry row appended when a loop's `onCap: "advance"` trips — makes the
  * soft-stop durable (post-hoc readers can distinguish "judge said done" from
  * "cap tripped"). Shape-discriminated like RoutingDecision; stage readers and
@@ -353,4 +369,4 @@ export {
 	summarizeRun,
 } from "./reads.js";
 export { resolveRun } from "./resolve.js";
-export { appendHeader, appendLoopCap, appendRoutingDecision, appendStage } from "./writes.js";
+export { appendHeader, appendLoopCap, appendModelEscalation, appendRoutingDecision, appendStage } from "./writes.js";

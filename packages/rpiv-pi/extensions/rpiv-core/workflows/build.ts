@@ -27,6 +27,7 @@
 // ===========================================================================
 
 import { execFileSync } from "node:child_process";
+import { readFileSync } from "node:fs";
 import { dirname, isAbsolute, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
@@ -53,6 +54,7 @@ import {
 	confirmDue,
 	designOutcome,
 	ELABORATE_PHASE_FANOUT,
+	elaborationCoverageGaps,
 	elaborationOutcome,
 	haltPreflight,
 	IMPLEMENT_DAG_FANOUT,
@@ -284,6 +286,8 @@ const buildWorkflow = defineWorkflow({
 		// counterpart to the LLM gates — the one human pass on the parallel path.
 		"design-review": produces({
 			skill: "design-review",
+			// The one human checkpoint: rpiv-wf refuses a completion no person answered.
+			checkpoint: true,
 			outcome: rpivBucketOutcome("designs"),
 			reads: [fanin("designs"), "slices"],
 		}),
@@ -392,6 +396,16 @@ const buildWorkflow = defineWorkflow({
 					);
 				}
 				const planPath = isAbsolute(plan.handle.path) ? plan.handle.path : join(cwd, plan.handle.path);
+				// Coverage before stitching: the stitch leaves an unelaborated phase as-is
+				// and reports success, so a failed elaborate unit would ship a partial splice.
+				const gaps = elaborationCoverageGaps(state, planPath, readFileSync(planPath, "utf-8"));
+				if (gaps.length > 0) {
+					throw haltPreflight(
+						"code-splice",
+						"code-splice: elaborations do not cover every plan phase",
+						`code-splice: refusing to stitch — missing elaborations: ${gaps.join(", ")}`,
+					);
+				}
 				try {
 					execFileSync("node", [STITCH_SCRIPT, planPath], { cwd, stdio: ["ignore", "pipe", "pipe"] });
 				} catch (err) {

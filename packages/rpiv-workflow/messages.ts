@@ -54,6 +54,12 @@ export const FAIL_WORKFLOW_ABORTED = (stage: string): FailureText => ({
 	error: `workflow aborted before stage "${stage}" (signal)`,
 });
 
+// A stage parked on a question for a person: a normal wait, resumed by answering it.
+export const FAIL_WORKFLOW_PARKED = (stage: string): FailureText => ({
+	toast: "rpiv: workflow parked — waiting for an answer",
+	error: `stage "${stage}" parked: waiting for a person's answer`,
+});
+
 export const FAIL_VALIDATION_EXHAUSTED = (skill: string, failures: string): FailureText => ({
 	toast: `rpiv: ${skill} output validation exhausted retries`,
 	error: `${skill} output validation failed after retries: ${failures}`,
@@ -239,6 +245,16 @@ export const FAIL_LOOP_CAP_HALT = (count: number, max: number): FailureText => (
 export const FAIL_FANOUT_ALL_FAILED = (skill: string, failed: number, total: number): FailureText => ({
 	toast: `rpiv: ${skill} fanout failed in full (${failed}/${total} units) — stopping workflow`,
 	error: `Fanout all-failed at stage "${skill}" (${failed}/${total} units failed)`,
+});
+
+/**
+ * A collect-all fanout generation closed with at least one failed slot (a hole)
+ * under the default `onHole: "halt"` — the run halts at the loop stage instead
+ * of handing a fan-in a partial set. `failedLabels` names the holes.
+ */
+export const FAIL_FANOUT_HOLE = (skill: string, failedLabels: readonly string[], total: number): FailureText => ({
+	toast: `rpiv: ${skill} fanout has ${failedLabels.length}/${total} failed unit(s) — stopping workflow`,
+	error: `Fanout hole at stage "${skill}" (${failedLabels.length}/${total} units failed: ${failedLabels.join(", ")}) — resume re-dispatches them`,
 });
 
 /**

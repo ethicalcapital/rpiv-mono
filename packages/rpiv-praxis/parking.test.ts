@@ -1,4 +1,4 @@
-import { mkdirSync, mkdtempSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it, vi } from "vitest";
@@ -27,6 +27,44 @@ describe("createRunParking", () => {
 		expect(readParks(cwd, "r1")[0]).toMatchObject({ stage: "pick", workflow: "wf", kata: "ab12", sessionId: "s1" });
 		expect(rp.parked()).toHaveLength(1);
 		expect(vi.mocked(kata.file).mock.calls[0]![1]).toBe("rpiv-wf answer r1 1 <choice>");
+	});
+
+	it("stores the context with the park and refreshes it from the turn's end (kata r923)", () => {
+		const cwd = project();
+		const kata: Kata = { file: vi.fn(() => "ab12"), close: vi.fn() };
+		const rp = createRunParking({ cwd, kata, stop: vi.fn(), notify: () => {} });
+		rp.lifecycle.onWorkflowStart!(lifecycleCtx);
+		rp.parking.park({ prompt: "/skill:d", sessionId: "s1", questions: [ask], context: "the 5 issues" });
+		expect(readParks(cwd, "r1")[0]!.context).toBe("the 5 issues");
+		expect(vi.mocked(kata.file).mock.calls[0]![0].context).toBe("the 5 issues");
+		rp.parking.noteContext!("other", "not mine");
+		rp.parking.noteContext!("s1", "the 5 issues, in full");
+		expect(readParks(cwd, "r1")[0]!.context).toBe("the 5 issues, in full");
+	});
+
+	it("records the stage the host says asked, not whichever started last (kata 79yy)", () => {
+		const cwd = project();
+		const rp = createRunParking({ cwd, stop: vi.fn(), notify: () => {} });
+		rp.lifecycle.onWorkflowStart!(lifecycleCtx);
+		rp.lifecycle.onStageStart!({ kind: "skill", name: "design (s1)", stageNumber: 1, skill: "d" }, lifecycleCtx);
+		rp.lifecycle.onStageStart!({ kind: "skill", name: "design (s2)", stageNumber: 2, skill: "d" }, lifecycleCtx);
+		rp.parking.park({ prompt: "/skill:d", sessionId: "s1", questions: [ask], stage: "design (s1)" });
+		expect(readParks(cwd, "r1")[0]).toMatchObject({ stage: "design (s1)" });
+	});
+
+	it("record appends an audit row to the run log", () => {
+		const cwd = project();
+		const rp = createRunParking({ cwd, stop: vi.fn(), notify: () => {} });
+		rp.lifecycle.onWorkflowStart!(lifecycleCtx);
+		rp.parking.record!({ type: "checkpoint-auto-accepted", stage: "design-review", reason: "flag" });
+		const rows = readFileSync(join(runsDir(cwd), "r1.jsonl"), "utf-8")
+			.trim()
+			.split("\n")
+			.map((l) => JSON.parse(l));
+		expect(rows).toEqual([
+			expect.objectContaining({ type: "checkpoint-auto-accepted", stage: "design-review", reason: "flag" }),
+		]);
+		expect(typeof rows[0].ts).toBe("string");
 	});
 
 	it("still stops the run when it cannot park (no run id yet)", () => {

@@ -1,13 +1,16 @@
 /**
  * Wires the host's Parking hooks to the park store and (optionally) kata, for
- * one rpiv-wf run or resume. The runner announces the run id and the current
- * stage through lifecycle events; a park stops the whole run through `stop`.
+ * one rpiv-wf run or resume. The runner announces the run id through lifecycle
+ * events; the host names the stage that asked (falling back to the stage that
+ * started last). A park calls `stop`, which rpiv-wf wires to a soft stop:
+ * siblings already running finish and are kept, and no new turn starts.
  */
 
 import type { LifecycleListeners } from "@juicesharp/rpiv-workflow";
 import type { Parking } from "./claude-host.js";
 import type { Kata } from "./kata.js";
 import { addPark, answeredParkFor, answerMessage, type Park, type ParkedQuestion, updatePark } from "./park-store.js";
+import { appendLedgerRow } from "./run-ledger.js";
 
 export interface RunParking {
 	parking: Parking;
@@ -61,19 +64,21 @@ export function createRunParking(opts: {
 				opts.stop();
 				return;
 			}
+			const asked = info.stage ?? stage;
 			let park = addPark(opts.cwd, {
 				runId,
 				workflow,
-				stage,
+				stage: asked,
 				prompt: info.prompt,
 				sessionId: info.sessionId,
 				sessionFile: info.sessionFile,
 				questions: toQuestions(info.questions),
+				...(info.context ? { context: info.context } : {}),
 			});
 			const ref = opts.kata?.file(park, `rpiv-wf answer ${runId} ${park.n} <choice>`);
 			if (ref) park = updatePark(opts.cwd, runId, park.n, { kata: ref }) ?? park;
 			recorded.push(park);
-			opts.notify(`parked ${stage ?? "stage"}: ${park.questions[0]?.question ?? "a question"}`);
+			opts.notify(`parked ${asked ?? "stage"}: ${park.questions[0]?.question ?? "a question"}`);
 			opts.stop();
 		},
 		answerFor(prompt) {
@@ -92,9 +97,21 @@ export function createRunParking(opts: {
 		},
 	};
 
+	parking.record = (row) => {
+		if (runId) appendLedgerRow(opts.cwd, runId, { ts: new Date().toISOString(), ...row });
+		opts.notify(`${row.type}${row.stage ? ` (${row.stage})` : ""}`);
+	};
+
 	parking.noteUsage = (sessionId, usage) => {
 		const park = recorded.find((p) => p.sessionId === sessionId);
 		if (park && runId) updatePark(opts.cwd, runId, park.n, { usage: usage as never });
+	};
+
+	parking.noteContext = (sessionId, context) => {
+		const park = recorded.find((p) => p.sessionId === sessionId);
+		if (!park || !runId || !context || context === park.context) return;
+		const updated = updatePark(opts.cwd, runId, park.n, { context });
+		if (updated) recorded[recorded.indexOf(park)] = updated;
 	};
 
 	const lifecycle: LifecycleListeners = {

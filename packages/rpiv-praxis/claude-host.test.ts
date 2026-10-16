@@ -10,6 +10,7 @@ import {
 	claudeModel,
 	PARKED_MESSAGE,
 	type Parking,
+	recommendedAnswers,
 } from "./claude-host.js";
 
 type Call = { prompt: string; options: Record<string, any> };
@@ -322,6 +323,46 @@ describe("ClaudeWorkflowHost — parking", () => {
 		expect(lastAssistant(branch).stopReason).toBe("aborted");
 	});
 
+	it("stores the text written before the question as the park's context (kata r923)", async () => {
+		const parking = parkingStub({ noteContext: vi.fn() });
+		const asking = {
+			type: "assistant",
+			session_id: "s1",
+			parent_tool_use_id: null,
+			message: { content: [{ type: "tool_use", name: "AskUserQuestion", input: ask }] },
+		};
+		const sdk = fakeSdk([
+			(call) =>
+				(async function* () {
+					yield init("s1");
+					yield say("s1", "Found 5 cross-slice issues:\n1. slice 2 and 4 both own the schema");
+					yield asking;
+					await call.options.canUseTool("AskUserQuestion", ask, { signal: new AbortController().signal });
+					yield say("s1", "Stopping as instructed.");
+					yield result("s1", "error_during_execution");
+				})(),
+		]);
+		await run(host(sdk.deps, { parking }).h);
+		const context = "Found 5 cross-slice issues:\n1. slice 2 and 4 both own the schema";
+		expect(parking.park).toHaveBeenCalledWith(expect.objectContaining({ context }));
+		// The turn-end refresh keeps the text before the question, not the post-park acknowledgement.
+		expect(parking.noteContext).toHaveBeenCalledWith("s1", context);
+	});
+
+	it("names the stage that actually asked in the park (kata 79yy)", async () => {
+		const parking = parkingStub();
+		const sdk = fakeSdk([
+			(call) =>
+				(async function* () {
+					yield init("s1");
+					await call.options.canUseTool("AskUserQuestion", ask, { signal: new AbortController().signal });
+					yield result("s1", "error_during_execution");
+				})(),
+		]);
+		await run(host(sdk.deps, { parking }).h, { stage: "design (slice-2)" });
+		expect(parking.park).toHaveBeenCalledWith(expect.objectContaining({ stage: "design (slice-2)" }));
+	});
+
 	it("denies every other tool, exactly as an unattended run without the callback would", async () => {
 		const parking = parkingStub();
 		let verdict: any;
@@ -379,6 +420,13 @@ describe("ClaudeWorkflowHost — usage is per turn, not cumulative", () => {
 		expect(seen[1]).toBeCloseTo(0.03);
 	});
 
+	it("attributes each turn's usage to the engine's stage name for the child", async () => {
+		const seen: Array<{ stage?: string; sessionId: string }> = [];
+		const sdk = fakeSdk([() => [init("s1"), say("s1", "a"), res("s1", 0.02)]]);
+		await run(host(sdk.deps, { onUsage: (_u, info) => seen.push(info) }).h, { stage: "impl (phase-2)" });
+		expect(seen).toEqual([{ stage: "impl (phase-2)", sessionId: "s1" }]);
+	});
+
 	it("starts a resumed parked session from the baseline saved with the park", async () => {
 		const seen: number[] = [];
 		const parking = {
@@ -411,5 +459,165 @@ describe("ClaudeWorkflowHost — usage is per turn, not cumulative", () => {
 		});
 		expect(seen[0]).toBeCloseTo(0.04);
 		expect(seen[1]).toBeCloseTo(0.01);
+	});
+});
+
+describe("ClaudeWorkflowHost — human checkpoints (kata ac4x)", () => {
+	const confirm = {
+		questions: [
+			{ question: "Accept the design?", options: [{ label: "Accept (Recommended)" }, { label: "Adjust a slice" }] },
+		],
+	};
+	const stub = (over: Partial<Parking> = {}) =>
+		({ park: vi.fn(), answerFor: vi.fn(() => undefined), record: vi.fn(), ...over }) as Parking & {
+			park: ReturnType<typeof vi.fn>;
+			record: ReturnType<typeof vi.fn>;
+		};
+	const asking = () =>
+		fakeSdk([
+			(call) =>
+				(async function* () {
+					yield init("s1");
+					call.options.verdict = await call.options.canUseTool("AskUserQuestion", confirm, {
+						signal: new AbortController().signal,
+					});
+					yield result("s1");
+				})(),
+		]);
+	const silent = () => fakeSdk([() => [init("s1"), say("s1", "design accepted: 3 slices"), result("s1")]]);
+
+	it("a checkpoint that completes without asking fails the stage", async () => {
+		const { h, notes } = host(silent().deps, { parking: stub() });
+		const { branch } = await run(h, { stage: "design-review", checkpoint: true });
+		expect(lastAssistant(branch).stopReason).toBe("error");
+		expect(notes.join("\n")).toMatch(/human checkpoint design-review completed without a person's answer/);
+	});
+
+	it("an ordinary stage that completes without asking is fine", async () => {
+		const { branch } = await run(host(silent().deps, { parking: stub() }).h, { stage: "plan" });
+		expect(lastAssistant(branch).stopReason).toBe("stop");
+	});
+
+	it("a checkpoint resumed with a person's answer may complete", async () => {
+		const delivered = vi.fn();
+		const parking = stub({ answerFor: vi.fn(() => ({ sessionId: "p1", message: "Answer: Accept", delivered })) });
+		const sdk = fakeSdk([() => [say("p1", "design accepted"), result("p1")]]);
+		const { branch } = await run(host(sdk.deps, { parking }).h, { stage: "design-review", checkpoint: true });
+		expect(lastAssistant(branch).stopReason).toBe("stop");
+	});
+
+	it("a checkpoint's question always parks, even when it carries a (Recommended) option", async () => {
+		const parking = stub();
+		const sdk = asking();
+		await run(host(sdk.deps, { parking, autoAcceptConfirmations: true }).h, {
+			stage: "design-review",
+			checkpoint: true,
+		});
+		expect(parking.park).toHaveBeenCalledOnce();
+		expect(sdk.calls[0]!.options.verdict).toMatchObject({ behavior: "deny", interrupt: true });
+	});
+
+	it("--auto-accept-checkpoints answers with the recommendation and logs it", async () => {
+		const parking = stub();
+		const sdk = asking();
+		const { branch } = await run(host(sdk.deps, { parking, autoAcceptCheckpoints: true }).h, {
+			stage: "design-review",
+			checkpoint: true,
+		});
+		expect(parking.park).not.toHaveBeenCalled();
+		expect(sdk.calls[0]!.options.verdict).toEqual({
+			behavior: "allow",
+			updatedInput: { ...confirm, answers: { "Accept the design?": "Accept (Recommended)" } },
+		});
+		expect(parking.record).toHaveBeenCalledWith(
+			expect.objectContaining({ type: "checkpoint-auto-accepted", stage: "design-review" }),
+		);
+		expect(lastAssistant(branch).stopReason).toBe("stop");
+	});
+
+	it("--auto-accept-checkpoints lets a silent checkpoint pass, and logs that too", async () => {
+		const parking = stub();
+		const { branch } = await run(host(silent().deps, { parking, autoAcceptCheckpoints: true }).h, {
+			stage: "design-review",
+			checkpoint: true,
+		});
+		expect(lastAssistant(branch).stopReason).toBe("stop");
+		expect(parking.record).toHaveBeenCalledWith(expect.objectContaining({ type: "checkpoint-auto-accepted" }));
+	});
+});
+
+describe("ClaudeWorkflowHost — routine confirmations (kata 439b)", () => {
+	const q = (question: string, labels: string[], multiSelect = false) => ({
+		question,
+		options: labels.map((label) => ({ label })),
+		...(multiSelect ? { multiSelect } : {}),
+	});
+	const stub = () =>
+		({ park: vi.fn(), answerFor: vi.fn(() => undefined), record: vi.fn() }) as Parking & {
+			park: ReturnType<typeof vi.fn>;
+			record: ReturnType<typeof vi.fn>;
+		};
+	const asking = (questions: unknown[]) =>
+		fakeSdk([
+			(call) =>
+				(async function* () {
+					yield init("s1");
+					call.options.verdict = await call.options.canUseTool(
+						"AskUserQuestion",
+						{ questions },
+						{ signal: new AbortController().signal },
+					);
+					yield result("s1", call.options.verdict.behavior === "deny" ? "error_during_execution" : "success");
+				})(),
+		]);
+	const writeIt = q("Scan complete. Write the research doc?", ["Write it (Recommended)", "Keep scanning"]);
+
+	it("classifies: one (Recommended) option per single-select question is a confirmation", () => {
+		expect(recommendedAnswers([writeIt])).toEqual({
+			"Scan complete. Write the research doc?": "Write it (Recommended)",
+		});
+		expect(recommendedAnswers([q("Which store?", ["Postgres", "SQLite"])])).toBeUndefined();
+		expect(recommendedAnswers([q("Pick", ["A (Recommended)", "B (Recommended)"])])).toBeUndefined();
+		expect(recommendedAnswers([q("Pick", ["A (Recommended)", "B"], true)])).toBeUndefined();
+		expect(recommendedAnswers([writeIt, q("Which store?", ["Postgres", "SQLite"])])).toBeUndefined();
+		expect(recommendedAnswers([])).toBeUndefined();
+	});
+
+	it("auto-accepts a confirmation with its recommendation and logs it, instead of parking", async () => {
+		const parking = stub();
+		const sdk = asking([writeIt]);
+		const { branch, child } = await run(host(sdk.deps, { parking, autoAcceptConfirmations: true }).h, {
+			stage: "research",
+		});
+		expect(parking.park).not.toHaveBeenCalled();
+		expect(sdk.calls[0]!.options.verdict).toEqual({
+			behavior: "allow",
+			updatedInput: { questions: [writeIt], answers: { [writeIt.question]: "Write it (Recommended)" } },
+		});
+		expect(parking.record).toHaveBeenCalledWith(
+			expect.objectContaining({ type: "confirmation-auto-accepted", stage: "research" }),
+		);
+		expect(lastAssistant(branch).stopReason).toBe("stop");
+		expect((child as unknown as { parked(): boolean }).parked()).toBe(false);
+	});
+
+	it("parks a decision, and parks a confirmation when auto-accept is off", async () => {
+		for (const [questions, auto] of [
+			[[q("Which store?", ["Postgres", "SQLite"])], true],
+			[[writeIt], false],
+		] as const) {
+			const parking = stub();
+			await run(host(asking([...questions]).deps, { parking, autoAcceptConfirmations: auto }).h, { stage: "s" });
+			expect(parking.park).toHaveBeenCalledOnce();
+			expect(parking.record).not.toHaveBeenCalled();
+		}
+	});
+
+	it("a park is reported as parked, without the error_during_execution warning", async () => {
+		const parking = stub();
+		const { h, notes } = host(asking([q("Which store?", ["Postgres", "SQLite"])]).deps, { parking });
+		const { child } = await run(h, { stage: "s" });
+		expect((child as unknown as { parked(): boolean }).parked()).toBe(true);
+		expect(notes.join("\n")).not.toContain("error_during_execution");
 	});
 });

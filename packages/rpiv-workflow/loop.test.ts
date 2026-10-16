@@ -433,6 +433,7 @@ describe("loop driver — retry-once dispatch (retryHaltedUnits)", () => {
 				loop: fanout({
 					units: () => [{ prompt: "u0", label: "u0", id: "u0" }],
 					...(retries !== undefined ? { retryHaltedUnits: retries } : {}),
+					onHole: "continue", // the collect-all-continue contract under test (onHole default is "halt")
 					...(opts.failFast ? { failFast: true } : {}),
 				}),
 			}),
@@ -549,7 +550,9 @@ describe("loop driver — retry-once dispatch (retryHaltedUnits)", () => {
 		const result = await runWorkflow(host.ctx, { workflow: retryWf(1, { outcome: recording }), input: "x" });
 		expect(result.success).toBe(true); // collect-all survives both halts
 		expect(host.spawns).toHaveLength(2); // both attempts ran
-		expect(seen).toEqual(["u0", "u0"]); // the fill fired on EACH attempt
+		// The fill fired on EACH attempt — twice per attempt: the initial collect and the
+		// re-collect after the one in-session collection nudge (kata mykj).
+		expect(seen).toEqual(["u0", "u0", "u0", "u0"]);
 	});
 });
 
@@ -948,6 +951,7 @@ describe("loop driver — haltWhenAllFailed generation-close halt", () => {
 					onCap: opts.max !== undefined ? ("advance" as const) : undefined,
 					...(opts.flagless ? {} : { haltWhenAllFailed: true }),
 					...(opts.retry !== undefined ? { retryHaltedUnits: opts.retry } : {}),
+					onHole: "continue", // the collect-all-continue contract under test (onHole default is "halt")
 				}),
 			}),
 			synthesize: acts({ reads: [fanin("audits")] }),
@@ -1346,6 +1350,36 @@ describe("loop driver — assess × panel", () => {
 		writeFile(rel, JSON.stringify({ done: isDone, feedback: name }));
 		return rel;
 	};
+
+	it("the panel close hands its fold the declared member count", async () => {
+		namedVerdict("v0a", true);
+		namedVerdict("v0b", true);
+		namedVerdict("v0c", true);
+		const seen: unknown[] = [];
+		const recordingFold = (verdicts: readonly Output[], info?: { members: number }) => {
+			seen.push(info);
+			return majority(done)(verdicts, info);
+		};
+		const chain = createMockSessionChain({
+			cwd: tmpDir,
+			steps: [
+				{ branch: [mockAssistantMessage("wrote .rpiv/artifacts/tasks/t0.md")] },
+				{ branch: [mockAssistantMessage("verdict .rpiv/verdicts/v0a.json")] },
+				{ branch: [mockAssistantMessage("verdict .rpiv/verdicts/v0b.json")] },
+				{ branch: [mockAssistantMessage("verdict .rpiv/verdicts/v0c.json")] },
+				{ branch: [mockAssistantMessage("consumed")] },
+			],
+		});
+		const loop = assess({
+			judge: panel({ members: threeMembers(), fold: recordingFold, outcome: verdictOutcome("panel-x") }),
+			done: panelPass,
+			feedForward: panelFeed,
+			max: 4,
+		});
+		const result = await runWorkflow(chain.ctx, { workflow: wf(loop), input: "x" });
+		expect(result.success).toBe(true);
+		expect(seen).toEqual([{ members: 3 }]);
+	});
 
 	it("runs N judge sessions then one produce; majority folds the verdict the `done` predicate reads", async () => {
 		namedVerdict("v0a", true);

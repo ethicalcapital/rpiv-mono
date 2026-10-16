@@ -27,6 +27,7 @@ import type {
 import { type SkillCatalog, translateSkillPrompt } from "./skills.js";
 import {
 	assistantEntry,
+	assistantTextSince,
 	locateSessionFile,
 	readSessionBranch,
 	stampStop,
@@ -66,6 +67,21 @@ export interface ClaudeHostOptions {
 	locate?: (sessionId: string) => string | undefined;
 	/** Park stages that ask a question instead of letting them guess (see Parking). */
 	parking?: Parking;
+	/**
+	 * Let a human-checkpoint stage (`checkpoint: true`) pass without a person:
+	 * its question is answered with its (Recommended) option, or a completion
+	 * without a question is accepted. Every such pass is a run-log row. Off by
+	 * default: a checkpoint that completes with no person's answer fails.
+	 */
+	autoAcceptCheckpoints?: boolean;
+	/**
+	 * Answer a routine confirmation instead of parking it: a question set where
+	 * every question is single-select with exactly one (Recommended) option is
+	 * answered with those options and logged as a `confirmation-auto-accepted`
+	 * run-log row. Anything else is a decision and parks. Never applies to a
+	 * human-checkpoint stage. rpiv-wf turns it on (--park-confirmations turns it off).
+	 */
+	autoAcceptConfirmations?: boolean;
 	/** Effort for every stage unless the stage's own model selection sets thinking. */
 	effort?: Effort;
 	/** The built-in tools stages may use (default: Claude Code's full set). */
@@ -74,8 +90,9 @@ export interface ClaudeHostOptions {
 	disallowedTools?: string[];
 	/** Which settings (and CLAUDE.md memory) stages load: default user + project + local. */
 	settingSources?: SettingSource[];
-	/** Called once per turn with what it cost: the raw material for evals. */
-	onUsage?: (usage: TurnUsage) => void;
+	/** Called once per turn with what it cost: the raw material for evals and the run ledger.
+	 *  `info.stage` is the engine's stage name for the child (undefined when the engine gave none). */
+	onUsage?: (usage: TurnUsage, info: { stage?: string; sessionId: string }) => void;
 }
 
 type SettingSource = NonNullable<Options["settingSources"]>[number];
@@ -114,7 +131,16 @@ export interface TurnUsage {
  * and sends the answer instead of starting the stage over.
  */
 export interface Parking {
-	park(info: { prompt: string; sessionId: string; sessionFile?: string; questions: unknown }): void;
+	/** `stage` is the engine's name for the stage that asked (undefined when the engine gave none). */
+	park(info: {
+		prompt: string;
+		sessionId: string;
+		sessionFile?: string;
+		questions: unknown;
+		stage?: string;
+		/** The assistant text of the asking turn: what the question refers to. */
+		context?: string;
+	}): void;
 	answerFor(prompt: string):
 		| {
 				sessionId: string;
@@ -125,8 +151,37 @@ export interface Parking {
 				usage?: SessionUsage;
 		  }
 		| undefined;
+	/**
+	 * Refresh a park's context once its turn has ended: the text written before
+	 * the question may reach the branch after the permission callback fired.
+	 */
+	noteContext?(sessionId: string, context: string): void;
 	/** Record a parked session's cumulative usage once its interrupted turn reports it. */
 	noteUsage?(sessionId: string, usage: SessionUsage): void;
+	/** Append an audit row (an auto-accepted question or checkpoint) to the run log. */
+	record?(row: { type: string; stage?: string } & Record<string, unknown>): void;
+}
+
+/** The suffix that marks an AskUserQuestion option as the asker's recommendation. */
+const RECOMMENDED = /\(recommended\)\s*$/i;
+
+/**
+ * The answers a person would give by taking every question's recommendation:
+ * `{ question: label }` when each question is single-select with exactly one
+ * (Recommended) option, else undefined (the questions need a person).
+ */
+export function recommendedAnswers(questions: unknown): Record<string, string> | undefined {
+	if (!Array.isArray(questions) || questions.length === 0) return undefined;
+	const answers: Record<string, string> = {};
+	for (const q of questions as Array<{ question?: unknown; options?: unknown; multiSelect?: unknown }>) {
+		if (typeof q?.question !== "string" || q.multiSelect === true || !Array.isArray(q.options)) return undefined;
+		const picks = (q.options as Array<{ label?: unknown }>).filter(
+			(o) => typeof o?.label === "string" && RECOMMENDED.test(o.label),
+		);
+		if (picks.length !== 1) return undefined;
+		answers[q.question] = picks[0]!.label as string;
+	}
+	return answers;
 }
 
 /** What the model reads when its question is parked: stop, do not guess. */
@@ -257,7 +312,16 @@ export class ClaudeWorkflowHost implements WorkflowHostContext {
 			if (s?.aborted) abort.abort();
 			s?.addEventListener("abort", onAbort, { once: true });
 		}
-		const child = new ClaudeChildSession(this, this.opts, this.deps, options.model, abort, options.prompt);
+		const child = new ClaudeChildSession(
+			this,
+			this.opts,
+			this.deps,
+			options.model,
+			abort,
+			options.prompt,
+			options.stage,
+			options.checkpoint === true,
+		);
 		try {
 			if (options.reattach) {
 				const file = options.reattach.sessionFile;
@@ -277,6 +341,7 @@ export class ClaudeWorkflowHost implements WorkflowHostContext {
 					if (answered.usage) this.usageSeen.set(answered.sessionId, answered.usage);
 					const file = answered.sessionFile ?? this.locate(answered.sessionId);
 					child.adopt(answered.sessionId, file ?? "", file);
+					child.answered = true;
 					await child.sendUserMessage(answered.message);
 					answered.delivered();
 				} else {
@@ -305,7 +370,11 @@ class ClaudeChildSession implements WorkflowSessionContext {
 	private sessionFile: string | undefined;
 	private readonly branch: BranchEntry[] = [];
 	private queue: Promise<void> = Promise.resolve();
-	private parked = false;
+	private isParked = false;
+	/** Branch index where the current turn began: a park's context is the text written since. */
+	private turnStart = 0;
+	/** A person's answer reached this session (a resumed park): a checkpoint may complete. */
+	answered = false;
 
 	constructor(
 		private readonly parent: ClaudeWorkflowHost,
@@ -315,6 +384,10 @@ class ClaudeChildSession implements WorkflowSessionContext {
 		private readonly abort: AbortController,
 		/** The stage prompt this child was opened for: the key a park is found by on resume. */
 		private readonly stagePrompt: string,
+		/** The engine's stage name for this child (attribution for usage and parks). */
+		private readonly stage?: string,
+		/** A human checkpoint: never completes without a person's answer (unless opted out). */
+		private readonly checkpoint = false,
 	) {
 		this.cwd = parent.cwd;
 		this.maxConcurrency = parent.maxConcurrency;
@@ -343,6 +416,11 @@ class ClaudeChildSession implements WorkflowSessionContext {
 
 	spawnChild<T>(options: SpawnOptions<T>): Promise<T> {
 		return this.parent.spawnChild(options);
+	}
+
+	/** The stage stopped to wait for a person: the runner words the stop as a park, not an abort. */
+	parked(): boolean {
+		return this.isParked;
 	}
 
 	/** Queue a turn; `waitForIdle` settles it. Never rejects: failures land in the branch as a stop reason. */
@@ -395,18 +473,60 @@ class ClaudeChildSession implements WorkflowSessionContext {
 				message: `${name} needs approval, and no one can grant it in an unattended rpiv-wf run (permission mode ${this.opts.permissionMode}).`,
 			};
 		}
-		this.parked = true;
+		const auto = this.checkpoint ? this.opts.autoAcceptCheckpoints : this.opts.autoAcceptConfirmations;
+		if (auto) {
+			const answers = recommendedAnswers(input.questions);
+			if (answers) {
+				if (this.checkpoint) this.answered = true;
+				this.opts.parking.record?.({
+					type: this.checkpoint ? "checkpoint-auto-accepted" : "confirmation-auto-accepted",
+					...(this.stage !== undefined ? { stage: this.stage } : {}),
+					answers,
+					reason: this.checkpoint
+						? "--auto-accept-checkpoints"
+						: "routine confirmation: took the (Recommended) option",
+				});
+				this.ui.notify(`${this.stage ?? "stage"} auto-accepted: ${Object.values(answers).join("; ")}`, "warning");
+				return { behavior: "allow" as const, updatedInput: { ...input, answers } };
+			}
+		}
+		this.isParked = true;
+		const context = assistantTextSince(this.branch, this.turnStart);
 		this.opts.parking.park({
+			...(context ? { context } : {}),
 			prompt: this.stagePrompt,
 			sessionId: this.sessionId,
 			sessionFile: this.sessionManager.getSessionFile(),
 			questions: input.questions,
+			...(this.stage !== undefined ? { stage: this.stage } : {}),
 		});
 		return { behavior: "deny" as const, message: PARKED_MESSAGE, interrupt: true };
 	}
 
+	/**
+	 * A checkpoint turn that ended without parking and without a person's answer
+	 * fails the stage: the human checkpoint did not happen. With
+	 * --auto-accept-checkpoints it passes instead, recorded in the run log.
+	 */
+	private refuseUnansweredCheckpoint(): void {
+		if (!this.checkpoint || !this.opts.parking || this.answered) return;
+		if (this.opts.autoAcceptCheckpoints) {
+			this.answered = true;
+			this.opts.parking.record?.({
+				type: "checkpoint-auto-accepted",
+				...(this.stage !== undefined ? { stage: this.stage } : {}),
+				reason: "--auto-accept-checkpoints; the stage completed without asking",
+			});
+			return;
+		}
+		const msg = `human checkpoint ${this.stage ?? "stage"} completed without a person's answer; it must ask (AskUserQuestion) or the run must pass --auto-accept-checkpoints`;
+		this.ui.notify(msg, "error");
+		this.branch.push(assistantEntry([{ type: "text", text: msg }], "error"));
+	}
+
 	private async turn(prompt: string): Promise<void> {
 		const start = this.branch.length;
+		this.turnStart = start;
 		this.branch.push(userEntry(prompt));
 		if (this.abort.signal.aborted || this.opts.halt?.aborted) {
 			stampStop(this.branch, "aborted", start);
@@ -428,17 +548,25 @@ class ClaudeChildSession implements WorkflowSessionContext {
 					}
 				} else if (msg.type === "result") {
 					const sid = this.sessionId ?? "";
-					this.opts.onUsage?.(turnUsage(msg, toolCalls, this.parent.usageSeen.get(sid)));
+					this.opts.onUsage?.(turnUsage(msg, toolCalls, this.parent.usageSeen.get(sid)), {
+						...(this.stage !== undefined ? { stage: this.stage } : {}),
+						sessionId: sid,
+					});
 					const total = sessionUsageOf(msg);
 					this.parent.usageSeen.set(sid, total);
-					if (this.parked) this.opts.parking?.noteUsage?.(sid, total);
+					if (this.isParked) this.opts.parking?.noteUsage?.(sid, total);
 					stampStop(this.branch, stopReasonForResult(msg), start);
-					if (msg.subtype !== "success") this.ui.notify(`stage turn ended: ${msg.subtype}`, "warning");
+					// A parked turn ends error_during_execution by design: that is a wait, not a failure.
+					if (msg.subtype !== "success" && !this.isParked)
+						this.ui.notify(`stage turn ended: ${msg.subtype}`, "warning");
 				}
 			}
-			if (this.abort.signal.aborted || this.parked) stampStop(this.branch, "aborted", start);
+			if (this.isParked && this.sessionId)
+				this.opts.parking?.noteContext?.(this.sessionId, assistantTextSince(this.branch, start));
+			if (this.abort.signal.aborted || this.isParked) stampStop(this.branch, "aborted", start);
+			else this.refuseUnansweredCheckpoint();
 		} catch (err) {
-			const aborted = this.abort.signal.aborted || this.parked;
+			const aborted = this.abort.signal.aborted || this.isParked;
 			if (!aborted) this.ui.notify(`Claude session error: ${String(err)}`, "error");
 			stampStop(this.branch, aborted ? "aborted" : "error", start);
 		}
